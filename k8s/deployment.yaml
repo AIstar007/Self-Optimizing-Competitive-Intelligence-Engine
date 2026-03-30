@@ -1,0 +1,230 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: competitive-intelligence
+  labels:
+    name: competitive-intelligence
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ci-engine-config
+  namespace: competitive-intelligence
+data:
+  ENV: "production"
+  LOG_LEVEL: "info"
+  LOG_FORMAT: "json"
+  API_PORT: "8000"
+  WORKERS: "4"
+  TIMEOUT: "60"
+
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: ci-engine-secrets
+  namespace: competitive-intelligence
+type: Opaque
+stringData:
+  DATABASE_URL: "postgresql://ci_user:CHANGE_ME@postgres.competitive-intelligence.svc.cluster.local:5432/competitive_intelligence"
+  REDIS_URL: "redis://redis.competitive-intelligence.svc.cluster.local:6379"
+  OPENAI_API_KEY: "CHANGE_ME"
+  ANTHROPIC_API_KEY: "CHANGE_ME"
+  JWT_SECRET: "CHANGE_ME"
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ci-engine-api
+  namespace: competitive-intelligence
+  labels:
+    app: ci-engine
+    component: api
+spec:
+  replicas: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: ci-engine
+      component: api
+  template:
+    metadata:
+      labels:
+        app: ci-engine
+        component: api
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: ci-engine
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+      containers:
+      - name: api
+        image: competitive-intelligence:latest
+        imagePullPolicy: IfNotPresent
+        ports:
+        - name: http
+          containerPort: 8000
+          protocol: TCP
+        envFrom:
+        - configMapRef:
+            name: ci-engine-config
+        - secretRef:
+            name: ci-engine-secrets
+        resources:
+          requests:
+            cpu: 500m
+            memory: 512Mi
+          limits:
+            cpu: 2000m
+            memory: 2Gi
+        livenessProbe:
+          httpGet:
+            path: /api/v1/health
+            port: http
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /api/v1/ready
+            port: http
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 2
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: false
+          capabilities:
+            drop:
+            - ALL
+        volumeMounts:
+        - name: logs
+          mountPath: /app/logs
+      volumes:
+      - name: logs
+        emptyDir: {}
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: app
+                  operator: In
+                  values:
+                  - ci-engine
+              topologyKey: kubernetes.io/hostname
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ci-engine-api
+  namespace: competitive-intelligence
+  labels:
+    app: ci-engine
+    component: api
+spec:
+  type: ClusterIP
+  selector:
+    app: ci-engine
+    component: api
+  ports:
+  - name: http
+    port: 80
+    targetPort: http
+    protocol: TCP
+
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: ci-engine-hpa
+  namespace: competitive-intelligence
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: ci-engine-api
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+      - type: Percent
+        value: 50
+        periodSeconds: 60
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies:
+      - type: Percent
+        value: 100
+        periodSeconds: 15
+      - type: Pods
+        value: 2
+        periodSeconds: 15
+      selectPolicy: Max
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ci-engine
+  namespace: competitive-intelligence
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ci-engine
+  namespace: competitive-intelligence
+rules:
+- apiGroups: [""]
+  resources: ["configmaps"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["get"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ci-engine
+  namespace: competitive-intelligence
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: ci-engine
+subjects:
+- kind: ServiceAccount
+  name: ci-engine
+  namespace: competitive-intelligence
